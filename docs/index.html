@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Map Tile Baker</title>
+<link rel="stylesheet" href="vendor/leaflet.css" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>Map Tile Baker</h1>
+  <p>
+    Bakes a basemap into the 1-bit <code>MTLB</code> tile blob read by
+    <code>NicheGraphics::MapTiles</code>, entirely in your browser - draw a region per zoom level
+    (or use the whole world), preview how it'll render, then bake and download. Vector mode
+    defaults to <a href="https://openfreemap.org/" target="_blank" rel="noopener">OpenFreeMap</a>
+    (free, keyless, no rate limit - &copy; OpenMapTiles, data &copy; OpenStreetMap contributors).
+  </p>
+</header>
+
+<main>
+  <div id="configColumn">
+    <section class="panel" id="sourcePanel">
+      <h2>Source</h2>
+      <label for="modeSelect">Mode</label>
+      <select id="modeSelect">
+        <option value="vector">Vector (rasterized here, from raw map data)</option>
+        <option value="raster">Raster (pre-rendered tile images)</option>
+      </select>
+
+      <div id="vectorFields">
+        <label for="vectorUrlTemplate">Vector tile URL template</label>
+        <input type="text" id="vectorUrlTemplate" placeholder="https://.../{z}/{x}/{y}.pbf" />
+        <p class="hint">Defaults to OpenFreeMap's current planet endpoint. Paste any other OpenMapTiles-schema vector tile URL to use a different source.</p>
+        <div class="row">
+          <div>
+            <label for="vectorSourceMaxzoom">Source max zoom</label>
+            <input type="number" id="vectorSourceMaxzoom" value="14" min="0" max="22" />
+          </div>
+          <div>
+            <label for="vectorLineWidth">Line width (px)</label>
+            <input type="number" id="vectorLineWidth" value="1" min="1" max="8" />
+          </div>
+        </div>
+        <p class="hint">Requests deeper than source max zoom reuse ("overzoom") that tile's data, scaled up.</p>
+
+        <fieldset>
+          <legend>Roads (transportation layer classes)</legend>
+          <div class="row">
+            <div><label for="roadMinzoom">Min zoom for any roads</label><input type="number" id="roadMinzoom" value="6" min="0" max="22" /></div>
+          </div>
+          <div class="checkbox-grid" id="roadClassesGrid"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Borders</legend>
+          <label for="boundaryMaxAdminLevel">Max admin_level to draw (country borders always included)</label>
+          <input type="number" id="boundaryMaxAdminLevel" value="10" min="2" max="12" />
+        </fieldset>
+
+        <fieldset>
+          <legend>Place labels</legend>
+          <div class="checkbox-grid" id="labelClassesGrid"></div>
+        </fieldset>
+
+        <label class="inline"><input type="checkbox" id="waterFill" checked /> Cut water out of solid land fill</label>
+      </div>
+
+      <div id="rasterFields" style="display:none">
+        <label for="rasterUrlTemplate">Raster tile URL template</label>
+        <input type="text" id="rasterUrlTemplate" placeholder="https://.../{z}/{x}/{y}.png?key=..." />
+        <p class="hint">No bundled preset - paste your provider's tile URL (e.g. a MapTiler style, Stadia Maps' Stamen Toner, etc).</p>
+        <label for="rasterThreshold">Grayscale threshold (0-255)</label>
+        <input type="range" id="rasterThreshold" min="0" max="255" value="128" />
+        <div class="stat-line"><span>Threshold</span><span class="v" id="rasterThresholdValue">128</span></div>
+        <label class="inline"><input type="checkbox" id="rasterInvert" /> Invert black/white</label>
+      </div>
+
+      <label for="tileSizeSelect">Tile size (px)</label>
+      <select id="tileSizeSelect">
+        <option value="512">512 (default - matches most devices)</option>
+        <option value="256">256</option>
+      </select>
+    </section>
+
+    <section class="panel" id="rowsPanel">
+      <h2>Zoom levels &amp; regions</h2>
+      <button id="addRowBtn">+ Add zoom level</button>
+      <div class="zoom-rows" id="zoomRows"></div>
+      <p class="hint" id="plannedTotalHint"></p>
+    </section>
+
+    <section class="panel" id="runPanel">
+      <h2>Run settings</h2>
+      <div class="row">
+        <div><label for="workers">Concurrent fetches</label><input type="number" id="workers" value="16" min="1" max="64" /></div>
+        <div><label for="maxFailures">Stop after N consecutive failures</label><input type="number" id="maxFailures" value="10" min="1" max="100" /></div>
+      </div>
+      <label for="outputFilename">Output filename</label>
+      <input type="text" id="outputFilename" value="world_blob.bin" />
+      <label class="inline"><input type="checkbox" id="emitHeader" /> Also export a MapTile.h header (small datasets only)</label>
+
+      <label for="extendBlobInput">Extend an existing blob (optional)</label>
+      <input type="file" id="extendBlobInput" accept=".bin" />
+      <p class="hint" id="extendBlobStatus">Tiles already in the uploaded blob are kept as-is and skipped, not re-fetched. Not guarded against mixed settings - see docs/vendor/README.md.</p>
+
+      <div class="row" style="margin-top:0.75rem">
+        <button class="primary" id="startBakeBtn">Start bake</button>
+        <button class="danger" id="stopBakeBtn" disabled>Stop &amp; keep partial</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="mainColumn">
+    <section class="panel">
+      <h2>Region picker</h2>
+      <div id="regionMap"></div>
+      <p class="hint">Click "Draw" on a zoom row, then drag a rectangle on the map. Click "Pick preview spot" below to choose where the live preview samples from.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Live component preview</h2>
+      <div class="row">
+        <button id="pickPreviewBtn">Pick preview spot on map</button>
+        <div><label for="previewZoom">Preview zoom</label><input type="number" id="previewZoom" value="10" min="0" max="22" /></div>
+      </div>
+      <p class="hint" id="previewStatus">Pick a spot on the map above to preview how current settings render there.</p>
+      <div id="previewCanvasWrap">
+        <div>
+          <div class="hint">Rendered</div>
+          <canvas id="previewRawCanvas" width="256" height="256"></canvas>
+        </div>
+        <div>
+          <div class="hint">Thresholded (what gets baked)</div>
+          <canvas id="previewThresholdCanvas" width="256" height="256"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Estimate</h2>
+      <div class="stat-line"><span>Planned tiles</span><span class="v" id="estPlanned">-</span></div>
+      <div class="stat-line"><span>Estimated download size</span><span class="v" id="estDownload">-</span></div>
+      <div class="stat-line"><span>Estimated output blob size</span><span class="v" id="estOutput">-</span></div>
+      <div class="stat-line"><span>Estimated time</span><span class="v" id="estTime">-</span></div>
+      <p class="hint" id="estNote">Estimates refine once baking starts.</p>
+      <p class="warning" id="estWarning"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Progress</h2>
+      <progress id="bakeProgress" value="0" max="1"></progress>
+      <div class="stat-line"><span>Tiles</span><span class="v" id="progressTiles">0 / 0</span></div>
+      <div class="stat-line"><span>Rate</span><span class="v" id="progressRate">-</span></div>
+      <div class="stat-line"><span>Downloaded</span><span class="v" id="progressDownloaded">-</span></div>
+      <div id="log"></div>
+    </section>
+
+    <section class="panel" id="reportPanel" style="display:none">
+      <h2>Bake report</h2>
+      <table class="report" id="reportTable"></table>
+      <div class="row" style="margin-top:0.75rem">
+        <a id="downloadBlobLink" class="button" download><button class="primary">Download .bin</button></a>
+        <a id="downloadHeaderLink" download style="display:none"><button>Download .h</button></a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="vendor/leaflet.js"></script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
