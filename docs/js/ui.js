@@ -1,5 +1,5 @@
 // DOM wiring: config form, per-zoom region rows, live preview, estimate, bake run, report/download.
-import { totalPlannedCount, tileXToLon, tileYToLat } from "./tileMath.js";
+import { totalPlannedCount, tileCountForRegion, tileXToLon, tileYToLat } from "./tileMath.js";
 import { parseBlob, writeBlob, computeZoomRanges } from "./blobFormat.js";
 import { runBake, summarizeBake } from "./bake.js";
 import {
@@ -79,6 +79,7 @@ function propagateRegion(row, region) {
   } else {
     setRowRegionEverywhere(row, region);
   }
+  refreshRowCoverage();
   scheduleEstimate();
   scheduleAutoPreviewRefresh();
 }
@@ -177,13 +178,36 @@ function regionLabel(region) {
   return `N${region.north.toFixed(2)} S${region.south.toFixed(2)} E${region.east.toFixed(2)} W${region.west.toFixed(2)}`;
 }
 
+/** "1,234 covered, 56 new" (etc) for a row, given the currently-uploaded existing blob (if any) -
+ * so it's clear which rows have real new fetching to do before a bake even starts. */
+function rowCoverageText(row) {
+  if (!state.existingTiles || state.existingTiles.size === 0) return "";
+  const region = row.whole ? { whole: true } : row.region || { whole: true };
+  const total = tileCountForRegion(row.zoom, region);
+  if (total === 0) return "";
+  const remaining = countRemainingByZoom([{ zoom: row.zoom, region }], state.existingTiles).get(row.zoom) || 0;
+  const covered = total - remaining;
+  if (covered === 0) return `${total.toLocaleString()} new`;
+  if (remaining === 0) return `${total.toLocaleString()} already covered`;
+  return `${covered.toLocaleString()} covered, ${remaining.toLocaleString()} new`;
+}
+
+/** Refreshes every row's coverage annotation - cheap (no network), call directly (not debounced)
+ * whenever rows or the uploaded existing-blob change. */
+function refreshRowCoverage() {
+  for (const row of state.rows) {
+    const el = document.querySelector(`.zoom-row[data-id="${row.id}"] .coverage-readout`);
+    if (el) el.textContent = rowCoverageText(row);
+  }
+}
+
 function renderRow(row) {
   const el = document.createElement("div");
   el.className = "zoom-row";
   el.dataset.id = String(row.id);
   el.innerHTML = `
     <input type="number" class="zoom-input" min="0" max="22" value="${row.zoom}" />
-    <span class="bbox-readout"><span class="swatch" style="background:${picker.colorFor(row.id)}"></span>${regionLabel(row.whole ? { whole: true } : row.region)}</span>
+    <span class="bbox-readout"><span class="swatch" style="background:${picker.colorFor(row.id)}"></span>${regionLabel(row.whole ? { whole: true } : row.region)}<span class="coverage-readout hint"></span></span>
     <label class="inline"><input type="checkbox" class="whole-cb" ${row.whole ? "checked" : ""} /> whole world</label>
     <select class="link-select" title="Share this row's region with another zoom level"></select>
     <button class="small draw-btn" type="button">Draw</button>
@@ -192,6 +216,7 @@ function renderRow(row) {
   el.querySelector(".zoom-input").addEventListener("change", (e) => {
     row.zoom = Math.max(0, Math.min(22, Number(e.target.value) || 0));
     refreshLinkSelects();
+    refreshRowCoverage();
     scheduleEstimate();
   });
   el.querySelector(".whole-cb").addEventListener("change", (e) => {
@@ -214,6 +239,7 @@ function renderRow(row) {
       propagateRegion(row, target.whole ? { whole: true } : target.region || { whole: true });
     }
     refreshLinkSelects();
+    refreshRowCoverage();
     scheduleEstimate();
   });
   el.querySelector(".draw-btn").addEventListener("click", () => picker.beginDraw(row.id));
@@ -228,6 +254,7 @@ function renderRow(row) {
   });
   $("zoomRows").appendChild(el);
   refreshLinkSelects();
+  refreshRowCoverage();
 }
 
 $("addRowBtn").addEventListener("click", () => {
@@ -382,25 +409,51 @@ async function refreshEstimate() {
     plannedCount > MAX_SANE_BAKE_TILES
       ? `That's ${plannedCount.toLocaleString()} tiles - probably too many to actually bake (narrow the region or lower the zoom). "Start bake" will ask you to confirm.`
       : "";
+
+  // Cheap (no network) - show immediately, before the sample pass even starts, so it's clear
+  // right away what a bake would actually skip vs. fetch.
+  const remainingByZoom = countRemainingByZoom(config.rows, config.existingTiles);
+  const newCount = [...remainingByZoom.values()].reduce((s, n) => s + n, 0);
+  $("estAlreadyCovered").textContent = (plannedCount - newCount).toLocaleString();
+  $("estNewTiles").textContent = newCount.toLocaleString();
+
   if (plannedCount === 0) {
     $("estDownload").textContent = "-";
     $("estOutput").textContent = "-";
     $("estTime").textContent = "-";
+    $("estNote").textContent = "";
+    return;
+  }
+  if (newCount === 0) {
+    $("estDownload").textContent = "0 B (everything already covered)";
+    $("estOutput").textContent = "-";
+    $("estTime").textContent = "0s";
+    $("estNote").textContent = "";
     return;
   }
   if ((config.mode === "raster" && !config.raster.urlTemplate) || (config.mode === "vector" && !config.vector.urlTemplate)) {
     return; // nothing to sample against yet
   }
 
-  const sample = await runSamplePass(config).catch(() => null);
+  // The sample pass does real fetches (can take a visible amount of time, especially at deep
+  // overzoom) - show that plainly instead of leaving stale numbers from a previous config up.
+  $("estDownload").textContent = "estimating...";
+  $("estOutput").textContent = "estimating...";
+  $("estTime").textContent = "estimating...";
+  $("estNote").textContent = "Sampling a few tiles to estimate - this fetches real data, so it can take a moment.";
+
+  const sample = await runSamplePass(config, undefined, (done, total) => {
+    if (generation !== estimateGeneration) return;
+    $("estNote").textContent = `Sampling tile ${done} of ${total} to estimate...`;
+  }).catch(() => null);
   if (generation !== estimateGeneration) return; // a newer request superseded this one
   if (!sample) {
     $("estDownload").textContent = "everything already covered by the uploaded blob";
     $("estOutput").textContent = "-";
     $("estTime").textContent = "-";
+    $("estNote").textContent = "";
     return;
   }
-  const remainingByZoom = countRemainingByZoom(config.rows, config.existingTiles);
   const { estDownloadBytes, estOutputBytes, estSeconds } = extrapolateEstimate(
     sample.perZoom, sample.bytesPerSec, remainingByZoom, config.workers,
   );
@@ -431,6 +484,7 @@ $("extendBlobInput").addEventListener("change", async (e) => {
 
     state.existingTiles = parsed;
     $("extendBlobStatus").textContent = `Loaded ${parsed.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
+    refreshRowCoverage();
     scheduleEstimate();
   } catch (err) {
     $("extendBlobStatus").textContent = `Failed to load '${file.name}': ${err.message || err}`;
@@ -479,19 +533,33 @@ $("startBakeBtn").addEventListener("click", async () => {
   $("reportPanel").style.display = "none";
   const startedAt = performance.now();
 
+  const remainingByZoom = countRemainingByZoom(config.rows, config.existingTiles);
+  const newCount = [...remainingByZoom.values()].reduce((s, n) => s + n, 0);
+  const alreadyCoveredCount = plannedCount - newCount;
+  logLine(
+    alreadyCoveredCount > 0
+      ? `Plan: ${plannedCount.toLocaleString()} tiles total - ${alreadyCoveredCount.toLocaleString()} already covered ` +
+          `(kept, not re-fetched), ${newCount.toLocaleString()} new to fetch now.`
+      : `Plan: ${plannedCount.toLocaleString()} tiles, all new - fetching now.`,
+  );
+
   const result = await runBake(config, {
-    onProgress({ done, total, elapsedSec, downloadBytes }) {
+    onProgress({ done, total, newlyFetched, newTotal, elapsedSec, downloadBytes }) {
       $("bakeProgress").value = total ? done / total : 0;
       $("bakeProgress").max = 1;
-      $("progressTiles").textContent = `${done} / ${total}`;
-      const tilesPerSec = elapsedSec > 0 ? done / elapsedSec : 0;
+      $("progressTiles").textContent = `${done.toLocaleString()} / ${total.toLocaleString()}`;
+      $("progressNewTiles").textContent = `${newlyFetched.toLocaleString()} / ${newTotal.toLocaleString()}`;
+      // Rate is newlyFetched/elapsed, not done/elapsed - `done` includes a potentially huge
+      // already-covered head start that took 0 time this run, which would otherwise show an
+      // absurd tiles/s number for a moment right as an "extend" bake starts.
+      const tilesPerSec = elapsedSec > 0 ? newlyFetched / elapsedSec : 0;
       $("progressRate").textContent = `${tilesPerSec.toFixed(1)} tiles/s`;
       $("progressDownloaded").textContent = formatBytes(downloadBytes);
 
-      // Live-tightening estimate: extrapolate remaining work from the running average so far.
-      if (done > 0 && done < total) {
-        const avgDownloadPerTile = downloadBytes / done;
-        const remaining = total - done;
+      // Live-tightening estimate: extrapolate remaining *new* work from the running average so far.
+      if (newlyFetched > 0 && newlyFetched < newTotal) {
+        const avgDownloadPerTile = downloadBytes / newlyFetched;
+        const remaining = newTotal - newlyFetched;
         $("estDownload").textContent = formatBytes(downloadBytes + avgDownloadPerTile * remaining);
         const bytesPerSec = elapsedSec > 0 ? downloadBytes / elapsedSec : 0;
         const remainingSec = bytesPerSec > 0 ? (avgDownloadPerTile * remaining) / bytesPerSec : null;

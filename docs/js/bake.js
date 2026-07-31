@@ -43,7 +43,12 @@ export function makeVectorFetcher(config) {
  *             labelClasses, lineWidth, waterFill },
  *   signal: AbortSignal,                      // Stop button
  * }
- * callbacks = { onProgress({done,total,elapsedSec,downloadBytes}), onTileError(coord,err,consecutiveFailures) }
+ * callbacks = { onProgress({done,total,newlyFetched,newTotal,elapsedSec,downloadBytes}),
+ *               onTileError(coord,err,consecutiveFailures) }
+ * done/total include tiles already covered by existingTiles (skipped, not re-fetched); those can
+ * be a large head start on `done` for an "extend an existing blob" run, so newlyFetched/newTotal
+ * (this run's actual fetch count, excluding anything skipped) is provided too, to keep the
+ * progress display honest about how much *new* work is happening.
  */
 export async function runBake(config, callbacks = {}) {
   const { workers, maxConsecutiveFailures, rows, existingTiles, signal } = config;
@@ -90,6 +95,8 @@ export async function runBake(config, callbacks = {}) {
       callbacks.onProgress?.({
         done: alreadyCached + fetchedCount,
         total: plannedCoords.length,
+        newlyFetched: fetchedCount,
+        newTotal: todo.length,
         elapsedSec: (performance.now() - startTime) / 1000,
         downloadBytes,
       });

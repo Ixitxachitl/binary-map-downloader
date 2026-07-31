@@ -133,7 +133,9 @@
 
     <section class="panel">
       <h2>Estimate</h2>
-      <div class="stat-line"><span>Planned tiles</span><span class="v" id="estPlanned">-</span></div>
+      <div class="stat-line"><span>Planned tiles (total)</span><span class="v" id="estPlanned">-</span></div>
+      <div class="stat-line"><span>Already covered (skip)</span><span class="v" id="estAlreadyCovered">-</span></div>
+      <div class="stat-line"><span>New tiles to fetch</span><span class="v" id="estNewTiles">-</span></div>
       <div class="stat-line"><span>Estimated download size</span><span class="v" id="estDownload">-</span></div>
       <div class="stat-line"><span>Estimated output blob size</span><span class="v" id="estOutput">-</span></div>
       <div class="stat-line"><span>Estimated time</span><span class="v" id="estTime">-</span></div>
@@ -144,7 +146,8 @@
     <section class="panel">
       <h2>Progress</h2>
       <progress id="bakeProgress" value="0" max="1"></progress>
-      <div class="stat-line"><span>Tiles</span><span class="v" id="progressTiles">0 / 0</span></div>
+      <div class="stat-line"><span>Tiles (incl. already-covered)</span><span class="v" id="progressTiles">0 / 0</span></div>
+      <div class="stat-line"><span>New this run</span><span class="v" id="progressNewTiles">0 / 0</span></div>
       <div class="stat-line"><span>Rate</span><span class="v" id="progressRate">-</span></div>
       <div class="stat-line"><span>Downloaded</span><span class="v" id="progressDownloaded">-</span></div>
       <div id="log"></div>

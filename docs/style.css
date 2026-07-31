@@ -116,6 +116,8 @@ legend { font-size: 0.8rem; color: var(--muted); padding: 0 0.4rem; }
 .zoom-row .link-select { width: 100%; font-size: 0.8rem; padding: 0.15rem 0.3rem; }
 .zoom-row .swatch { width: 0.8em; height: 0.8em; border-radius: 2px; display: inline-block; margin-right: 0.35em; }
 .zoom-row .bbox-readout { color: var(--muted); font-family: var(--mono); font-size: 0.78rem; }
+.zoom-row .coverage-readout { display: block; font-family: inherit; color: var(--accent); }
+.zoom-row .coverage-readout:empty { display: none; }
 
 #previewCanvasWrap {
   display: flex;

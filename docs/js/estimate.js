@@ -36,9 +36,11 @@ export function pickSample(rows, cap = DEFAULT_SAMPLE_CAP, existingTiles = null)
  * config.existingTiles, same as a real run would) to measure avg download bytes/tile and avg
  * compressed bytes/tile *per zoom* (density varies a lot by zoom), plus throughput. Returns null
  * if there was nothing to sample (e.g. everything's already covered by an uploaded blob, or
- * every row is empty).
+ * every row is empty). onProgress(done, total), if given, fires after each sample tile - this can
+ * take a real, visible amount of time (each sample tile is a genuine fetch+render), so callers
+ * should show *something* live rather than leaving stale numbers up while it runs.
  */
-export async function runSamplePass(config, cap = DEFAULT_SAMPLE_CAP) {
+export async function runSamplePass(config, cap = DEFAULT_SAMPLE_CAP, onProgress) {
   const sample = pickSample(config.rows, cap, config.existingTiles);
   if (sample.length === 0) return null;
 
@@ -47,12 +49,14 @@ export async function runSamplePass(config, cap = DEFAULT_SAMPLE_CAP) {
   let totalDownloadBytes = 0;
   const start = performance.now();
 
-  for (const coord of sample) {
+  for (let i = 0; i < sample.length; i++) {
+    const coord = sample[i];
     const [z] = coord;
     let result;
     try {
       result = await bakeSingleTile(coord, config, vectorFetcher);
     } catch {
+      onProgress?.(i + 1, sample.length);
       continue; // a flaky sample tile shouldn't sink the whole estimate
     }
     totalDownloadBytes += result.downloadBytes;
@@ -61,6 +65,7 @@ export async function runSamplePass(config, cap = DEFAULT_SAMPLE_CAP) {
     entry.downloadBytes += result.downloadBytes;
     entry.compressedBytes += result.kind === KIND_LZ4 ? result.payload.length : 0;
     perZoom.set(z, entry);
+    onProgress?.(i + 1, sample.length);
   }
 
   const elapsedSec = (performance.now() - start) / 1000;
