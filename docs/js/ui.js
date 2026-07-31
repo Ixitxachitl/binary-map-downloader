@@ -6,6 +6,7 @@ import {
   runSamplePass,
   extrapolateEstimate,
   countRemainingByZoom,
+  groupExistingTilesByZoom,
   formatBytes,
   formatDuration,
 } from "./estimate.js";
@@ -40,6 +41,7 @@ const state = {
   nextRowId: 1,
   nextLinkGroupId: 1,
   existingTiles: null,
+  existingTilesByZoom: null, // groupExistingTilesByZoom(existingTiles) - computed once per upload, not per row
   previewLocation: null, // { lat, lon }
 };
 
@@ -185,7 +187,7 @@ function rowCoverageText(row) {
   const region = row.whole ? { whole: true } : row.region || { whole: true };
   const total = tileCountForRegion(row.zoom, region);
   if (total === 0) return "";
-  const remaining = countRemainingByZoom([{ zoom: row.zoom, region }], state.existingTiles).get(row.zoom) || 0;
+  const remaining = countRemainingByZoom([{ zoom: row.zoom, region }], state.existingTilesByZoom).get(row.zoom) || 0;
   const covered = total - remaining;
   if (covered === 0) return `${total.toLocaleString()} new`;
   if (remaining === 0) return `${total.toLocaleString()} already covered`;
@@ -412,7 +414,7 @@ async function refreshEstimate() {
 
   // Cheap (no network) - show immediately, before the sample pass even starts, so it's clear
   // right away what a bake would actually skip vs. fetch.
-  const remainingByZoom = countRemainingByZoom(config.rows, config.existingTiles);
+  const remainingByZoom = countRemainingByZoom(config.rows, state.existingTilesByZoom);
   const newCount = [...remainingByZoom.values()].reduce((s, n) => s + n, 0);
   $("estAlreadyCovered").textContent = (plannedCount - newCount).toLocaleString();
   $("estNewTiles").textContent = newCount.toLocaleString();
@@ -472,6 +474,11 @@ $("extendBlobInput").addEventListener("change", async (e) => {
     const buf = await file.arrayBuffer();
     const parsed = parseBlob(buf);
 
+    // Grouped once here (O(n)), not rescanned per row/per estimate refresh - a big upload (a
+    // million+ tiles isn't unusual) made that rescan-per-row approach visibly slow.
+    state.existingTiles = parsed;
+    state.existingTilesByZoom = groupExistingTilesByZoom(parsed);
+
     if (
       rowsAreUntouchedDefault() ||
       confirm(
@@ -482,13 +489,13 @@ $("extendBlobInput").addEventListener("change", async (e) => {
       populateRowsFromTiles(parsed.values());
     }
 
-    state.existingTiles = parsed;
     $("extendBlobStatus").textContent = `Loaded ${parsed.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
     refreshRowCoverage();
     scheduleEstimate();
   } catch (err) {
     $("extendBlobStatus").textContent = `Failed to load '${file.name}': ${err.message || err}`;
     state.existingTiles = null;
+    state.existingTilesByZoom = null;
   }
 });
 
@@ -533,7 +540,7 @@ $("startBakeBtn").addEventListener("click", async () => {
   $("reportPanel").style.display = "none";
   const startedAt = performance.now();
 
-  const remainingByZoom = countRemainingByZoom(config.rows, config.existingTiles);
+  const remainingByZoom = countRemainingByZoom(config.rows, state.existingTilesByZoom);
   const newCount = [...remainingByZoom.values()].reduce((s, n) => s + n, 0);
   const alreadyCoveredCount = plannedCount - newCount;
   logLine(

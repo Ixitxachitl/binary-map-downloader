@@ -43,7 +43,11 @@
             <input type="number" id="vectorLineWidth" value="1" min="1" max="8" />
           </div>
         </div>
-        <p class="hint">Requests deeper than source max zoom reuse ("overzoom") that tile's data, scaled up.</p>
+        <p class="hint">The data source's own real max zoom (NOT the zoom you want to view - leave
+          this at OpenFreeMap's actual limit, 14, unless you're using a different source). Requests
+          deeper than this reuse ("overzoom") that tile's data, scaled up. Set this <em>higher</em>
+          than the source really goes and deeper zooms silently come back blank instead - the
+          server returns a valid-but-empty tile rather than an error, so nothing here fails loudly.</p>
 
         <fieldset>
           <legend>Roads (transportation layer classes)</legend>

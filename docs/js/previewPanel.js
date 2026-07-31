@@ -28,6 +28,7 @@ export async function renderPreview(config, lat, lon, zoom, canvases) {
 
   try {
     let imageData;
+    let emptySourceHint = "";
     if (config.mode === "raster") {
       const url = fillTileTemplate(config.raster.urlTemplate, z, tx, ty);
       const raw = await fetchTileBytes(url);
@@ -40,13 +41,25 @@ export async function renderPreview(config, lat, lon, zoom, canvases) {
       }
       const { bytes, overzoom } = await vectorFetcher(z, tx, ty);
       imageData = rasterizeVectorTile(bytes, z, { ...config.vector, tileSize: config.tileSize }, overzoom);
+      // A direct (non-overzoomed) fetch that comes back near-empty almost always means "Source
+      // max zoom" is set higher than this source actually goes - the server responds with a
+      // valid-but-empty tile for a zoom past its real data rather than an error, so nothing here
+      // throws; it just silently renders blank. overzoom.factor > 1 means overzoom DID kick in
+      // (fetched a shallower ancestor on purpose), so a small/empty result there is normal sparse
+      // data, not this problem.
+      if (overzoom.factor === 1 && bytes.length < 16) {
+        emptySourceHint =
+          ` - empty response from the source at z${z}. If you expect real data this deep, ` +
+          `check "Source max zoom" isn't set higher than where your source's data actually stops ` +
+          `(OpenFreeMap's real limit is 14) - overzoom only kicks in above that value.`;
+      }
     }
 
     drawImageDataToCanvas(imageData, rawCanvas);
     const threshold = config.mode === "raster" ? config.raster.threshold : 128;
     const invert = config.mode === "raster" ? config.raster.invert : false;
     drawImageDataToCanvas(thresholdPreview(imageData, config.tileSize, threshold, invert), thresholdCanvas);
-    statusEl.textContent = `z${z}/${tx}/${ty} - ${lat.toFixed(3)}, ${lon.toFixed(3)}`;
+    statusEl.textContent = `z${z}/${tx}/${ty} - ${lat.toFixed(3)}, ${lon.toFixed(3)}${emptySourceHint}`;
   } catch (err) {
     statusEl.textContent = `Preview failed: ${err?.message || err}`;
   }

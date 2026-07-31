@@ -109,21 +109,49 @@ function averageAcrossZooms(perZoomStats) {
   return count > 0 ? { count, downloadBytes, compressedBytes } : null;
 }
 
+/** One-time O(n) grouping of an uploaded blob's tiles by zoom - compute this once whenever the
+ * uploaded blob changes (not per row, not per estimate refresh) and reuse it. Without this,
+ * checking coverage per zoom row against a multi-hundred-thousand-tile upload by rescanning the
+ * whole thing every time (as an earlier version of this did, once per row *and* once per
+ * estimate refresh) is exactly what made a big "extend" upload feel like it was hanging. */
+export function groupExistingTilesByZoom(existingTiles) {
+  const byZoom = new Map();
+  if (!existingTiles) return byZoom;
+  for (const key of existingTiles.keys()) {
+    const commaAt = key.indexOf(",");
+    const z = Number(key.slice(0, commaAt));
+    const rest = key.slice(commaAt + 1);
+    const commaAt2 = rest.indexOf(",");
+    const x = Number(rest.slice(0, commaAt2));
+    const y = Number(rest.slice(commaAt2 + 1));
+    let arr = byZoom.get(z);
+    if (!arr) {
+      arr = [];
+      byZoom.set(z, arr);
+    }
+    arr.push(x, y); // flat pairs - avoids a small array allocation per tile
+  }
+  return byZoom;
+}
+
 /** Counts tiles per zoom that still need fetching (planned minus anything already present in an
  * uploaded/extended blob) - what extrapolateEstimate's countsByZoom should be measuring against,
  * since already-cached tiles cost nothing more to produce. Never enumerates a row's tile grid:
- * the planned count is O(1) math (tileCountForRegion), and matching against an uploaded blob
- * iterates the blob's (bounded) tile map instead of the (potentially enormous) planned grid. */
-export function countRemainingByZoom(rows, existingTiles) {
+ * the planned count is O(1) math (tileCountForRegion). `existingByZoom` is the pre-grouped
+ * structure from groupExistingTilesByZoom() - each row only scans its own zoom's (much smaller)
+ * subset, not the whole upload. */
+export function countRemainingByZoom(rows, existingByZoom) {
   const counts = new Map();
   for (const row of rows) {
     const total = tileCountForRegion(row.zoom, row.region);
     let alreadyCached = 0;
-    if (existingTiles && existingTiles.size > 0 && total > 0) {
+    const zoomTiles = existingByZoom?.get(row.zoom);
+    if (zoomTiles && zoomTiles.length > 0 && total > 0) {
       const { xMin, xMax, yMin, yMax } = tileRangeForRegion(row.zoom, row.region);
-      for (const key of existingTiles.keys()) {
-        const [z, x, y] = key.split(",").map(Number);
-        if (z === row.zoom && x >= xMin && x <= xMax && y >= yMin && y <= yMax) alreadyCached++;
+      for (let i = 0; i < zoomTiles.length; i += 2) {
+        const x = zoomTiles[i];
+        const y = zoomTiles[i + 1];
+        if (x >= xMin && x <= xMax && y >= yMin && y <= yMax) alreadyCached++;
       }
     }
     counts.set(row.zoom, (counts.get(row.zoom) || 0) + Math.max(0, total - alreadyCached));
