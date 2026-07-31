@@ -32,8 +32,10 @@ export function coordKey(zoom, tx, ty) {
 /** Derives each distinct zoom's {xMin,yMin,width,height} from the actual tx/ty extent of tiles
  * present for that zoom, in ascending zoom order - the shape the firmware's zoom-range table
  * expects. Assumes (as bake.js/tileMath.js already guarantee) that each zoom's tiles are exactly
- * one dense rectangle. */
-function computeZoomRanges(tiles) {
+ * one dense rectangle. Exported for ui.js too, to populate the zoom-row list from an uploaded
+ * blob's actual coverage. `tiles` can be any iterable of {zoom,tx,ty,...} - an array or a Map's
+ * .values() both work. */
+export function computeZoomRanges(tiles) {
   const byZoom = new Map();
   for (const t of tiles) {
     let r = byZoom.get(t.zoom);
@@ -150,39 +152,4 @@ export function parseBlob(arrayBuffer) {
     tiles.set(coordKey(zoom, tx, ty), { zoom, tx, ty, kind, payload });
   }
   return tiles;
-}
-
-/** Text equivalent of write_c_header() in generate_map_tiles.py - only practical for small test
- * datasets, since this data compiles into the firmware image. */
-export function writeHeaderText(tiles) {
-  const payload = [];
-  const offsets = [];
-  for (const t of tiles) {
-    offsets.push(payload.length);
-    for (const b of t.payload) payload.push(b);
-  }
-
-  const carr = (name, vals, ctype) => `static const ${ctype} ${name}[] = {${vals.join(", ")}};`;
-
-  const lines = [
-    "#pragma once",
-    "#include <stdint.h>",
-    "",
-    "static const uint8_t map_tile_layout = 0;",
-    "static const uint8_t map_tile_grid_cols = 0;",
-    "static const uint8_t map_tile_grid_rows = 0;",
-    "static const uint8_t map_tile_block_count = 0;",
-    `static const uint16_t map_tile_count = ${tiles.length};`,
-    carr("map_tile_zooms", tiles.map((t) => t.zoom), "uint8_t"),
-    carr("map_tile_tx", tiles.map((t) => t.tx), "uint16_t"),
-    carr("map_tile_ty", tiles.map((t) => t.ty), "uint16_t"),
-    "static const uint8_t map_tile_block_zooms[] = {};",
-    "static const uint16_t map_tile_block_tx[] = {};",
-    "static const uint16_t map_tile_block_ty[] = {};",
-    carr("map_tile_kinds", tiles.map((t) => t.kind), "uint8_t"),
-    carr("map_tile_sizes", tiles.map((t) => t.payload.length), "uint16_t"),
-    carr("map_tile_offsets", offsets, "uint32_t"),
-    carr("map_tile_data", payload, "uint8_t"),
-  ];
-  return lines.join("\n") + "\n";
 }

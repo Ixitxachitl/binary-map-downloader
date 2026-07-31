@@ -76,12 +76,6 @@
         <div class="stat-line"><span>Threshold</span><span class="v" id="rasterThresholdValue">128</span></div>
         <label class="inline"><input type="checkbox" id="rasterInvert" /> Invert black/white</label>
       </div>
-
-      <label for="tileSizeSelect">Tile size (px)</label>
-      <select id="tileSizeSelect">
-        <option value="512">512 (default - matches most devices)</option>
-        <option value="256">256</option>
-      </select>
     </section>
 
     <section class="panel" id="rowsPanel">
@@ -99,7 +93,6 @@
       </div>
       <label for="outputFilename">Output filename</label>
       <input type="text" id="outputFilename" value="world_blob.bin" />
-      <label class="inline"><input type="checkbox" id="emitHeader" /> Also export a MapTile.h header (small datasets only)</label>
 
       <label for="extendBlobInput">Extend an existing blob (optional)</label>
       <input type="file" id="extendBlobInput" accept=".bin" />
@@ -162,7 +155,6 @@
       <table class="report" id="reportTable"></table>
       <div class="row" style="margin-top:0.75rem">
         <a id="downloadBlobLink" class="button" download><button class="primary">Download .bin</button></a>
-        <a id="downloadHeaderLink" download style="display:none"><button>Download .h</button></a>
       </div>
     </section>
   </div>

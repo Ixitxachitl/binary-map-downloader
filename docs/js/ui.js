@@ -1,6 +1,6 @@
 // DOM wiring: config form, per-zoom region rows, live preview, estimate, bake run, report/download.
-import { totalPlannedCount } from "./tileMath.js";
-import { parseBlob, writeBlob, writeHeaderText } from "./blobFormat.js";
+import { totalPlannedCount, tileXToLon, tileYToLat } from "./tileMath.js";
+import { parseBlob, writeBlob, computeZoomRanges } from "./blobFormat.js";
 import { runBake, summarizeBake } from "./bake.js";
 import {
   runSamplePass,
@@ -125,12 +125,15 @@ function checkedValues(container) {
   );
 }
 
+// Every current Map-capable target uses 512px tiles (MapTiler's native fetch resolution) - see
+// generate_map_tiles.py's --tile-size / the firmware's kTileSizePx. Not exposed as a setting.
+const TILE_SIZE = 512;
+
 function buildConfig() {
   const mode = $("modeSelect").value;
-  const tileSize = Number($("tileSizeSelect").value);
   return {
     mode,
-    tileSize,
+    tileSize: TILE_SIZE,
     workers: Number($("workers").value) || 1,
     maxConsecutiveFailures: Number($("maxFailures").value) || 10,
     rows: state.rows.map((r) => ({ zoom: r.zoom, region: r.whole ? { whole: true } : r.region || { whole: true } })),
@@ -243,6 +246,61 @@ $("addRowBtn").addEventListener("click", () => {
 // Seed with one default row (zoom 0, whole world) so the tool isn't empty on load.
 $("addRowBtn").click();
 
+function removeAllRows() {
+  for (const row of state.rows) picker.removeRow(row.id);
+  state.rows = [];
+  $("zoomRows").innerHTML = "";
+}
+
+/** True if the row list is still exactly the untouched seed row - safe to replace without asking. */
+function rowsAreUntouchedDefault() {
+  return (
+    state.rows.length === 1 &&
+    state.rows[0].zoom === 0 &&
+    state.rows[0].whole === true &&
+    state.rows[0].linkGroupId == null
+  );
+}
+
+/** Converts a zoom-range's tile rectangle back to a lat/lon region - the inverse of
+ * tileMath.tileRangeForRegion. tileXToLon(tx,z)/tileYToLat(ty,z) give a tile's west/north edge
+ * respectively, so the region's east/south edges come from one tile past xMax/yMax. */
+function regionFromZoomRange(r) {
+  const n = 2 ** r.zoom;
+  const xMax = r.xMin + r.width - 1;
+  const yMax = r.yMin + r.height - 1;
+  if (r.xMin === 0 && r.yMin === 0 && r.width === n && r.height === n) {
+    return { whole: true };
+  }
+  return {
+    whole: false,
+    north: tileYToLat(r.yMin, r.zoom),
+    south: tileYToLat(yMax + 1, r.zoom),
+    west: tileXToLon(r.xMin, r.zoom),
+    east: tileXToLon(xMax + 1, r.zoom),
+  };
+}
+
+/** Replaces the zoom-row list with one row per zoom level present in `tiles` (an uploaded blob's
+ * parsed tiles), region set to match that zoom's actual coverage - so uploading a blob to extend
+ * shows what's already baked instead of leaving the row list unrelated to the file. */
+function populateRowsFromTiles(tiles) {
+  removeAllRows();
+  for (const r of computeZoomRanges(tiles)) {
+    const region = regionFromZoomRange(r);
+    const row = {
+      id: state.nextRowId++,
+      zoom: r.zoom,
+      whole: region.whole,
+      region: region.whole ? null : region,
+      linkGroupId: null,
+    };
+    state.rows.push(row);
+    renderRow(row);
+    if (!region.whole) picker.setRowRegion(row.id, region);
+  }
+}
+
 // --- Mode / source fields --------------------------------------------------
 
 function applyMode() {
@@ -269,7 +327,7 @@ for (const id of ["roadClassesGrid", "labelClassesGrid"]) {
 }
 for (const id of [
   "vectorSourceMaxzoom", "vectorLineWidth", "roadMinzoom", "boundaryMaxAdminLevel", "waterFill",
-  "rasterThreshold", "rasterInvert", "tileSizeSelect",
+  "rasterThreshold", "rasterInvert",
 ]) {
   $(id).addEventListener("input", () => {
     if (id === "rasterThreshold") $("rasterThresholdValue").textContent = $("rasterThreshold").value;
@@ -359,8 +417,20 @@ $("extendBlobInput").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const buf = await file.arrayBuffer();
-    state.existingTiles = parseBlob(buf);
-    $("extendBlobStatus").textContent = `Loaded ${state.existingTiles.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
+    const parsed = parseBlob(buf);
+
+    if (
+      rowsAreUntouchedDefault() ||
+      confirm(
+        "Replace the current zoom levels & regions with what's actually in this file? " +
+          "(Your in-progress row setup will be cleared - cancel to keep it and just extend from the file's tiles.)",
+      )
+    ) {
+      populateRowsFromTiles(parsed.values());
+    }
+
+    state.existingTiles = parsed;
+    $("extendBlobStatus").textContent = `Loaded ${parsed.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
     scheduleEstimate();
   } catch (err) {
     $("extendBlobStatus").textContent = `Failed to load '${file.name}': ${err.message || err}`;
@@ -472,17 +542,6 @@ function showReport(result, config) {
   const blobLink = $("downloadBlobLink");
   blobLink.href = blobUrl;
   blobLink.download = filename;
-
-  const headerLink = $("downloadHeaderLink");
-  if ($("emitHeader").checked) {
-    const headerText = writeHeaderText(tiles);
-    const headerUrl = URL.createObjectURL(new Blob([headerText], { type: "text/plain" }));
-    headerLink.href = headerUrl;
-    headerLink.download = filename.replace(/\.[^.]+$/, "") + ".h";
-    headerLink.style.display = "";
-  } else {
-    headerLink.style.display = "none";
-  }
 
   $("reportPanel").style.display = "";
 }
