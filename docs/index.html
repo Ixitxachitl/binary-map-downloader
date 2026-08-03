@@ -100,7 +100,7 @@
 
       <label for="extendBlobInput">Extend an existing blob (optional)</label>
       <input type="file" id="extendBlobInput" accept=".bin" />
-      <p class="hint" id="extendBlobStatus">Tiles already in the uploaded blob are kept as-is and skipped, not re-fetched. Not guarded against mixed settings - see docs/vendor/README.md.</p>
+      <p class="hint" id="extendBlobStatus">Tiles already in the uploaded blob are kept as-is and skipped, not re-fetched. If you change render settings (road classes, threshold, etc.) before extending, the newly-fetched tiles won't visually match the ones already in the file - nothing here checks for that.</p>
 
       <div class="row" style="margin-top:0.75rem">
         <button class="primary" id="startBakeBtn">Start bake</button>

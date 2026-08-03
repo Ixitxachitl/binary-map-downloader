@@ -7,12 +7,22 @@
 const ROW_COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#009688", "#f032e6", "#bcf60c"];
 
 export function createRegionPicker(containerId, { onRowRegionChange, onPreviewLocationChange } = {}) {
-  const map = L.map(containerId, { worldCopyJump: false }).setView([20, 0], 2);
+  // maxBounds + noWrap keep the visible/clickable map to a single wrap of longitude - without
+  // them, panning out (or across the antimeridian) shows repeated copies of the world, and a
+  // click/drag on one of those copies produces a longitude outside [-180,180] that tileMath.js's
+  // lonToTileX just clamps rather than wraps, silently picking the wrong tile. This matches the
+  // antimeridian limitation tileMath.js's tileRangeForRegion already documents.
+  const worldBounds = L.latLngBounds([-90, -180], [90, 180]);
+  const map = L.map(containerId, { worldCopyJump: false, maxBounds: worldBounds, maxBoundsViscosity: 1.0 }).setView(
+    [20, 0],
+    2,
+  );
   L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution:
       '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors ' +
       "(backdrop for drawing regions only - not part of the bake itself)",
     maxZoom: 19,
+    noWrap: true,
   }).addTo(map);
 
   const rowLayers = new Map(); // rowId -> L.Rectangle
@@ -59,9 +69,24 @@ export function createRegionPicker(containerId, { onRowRegionChange, onPreviewLo
     if (!drawing?.startLatLng) return;
     updateRect(drawing.rowId, L.latLngBounds(drawing.startLatLng, e.latlng));
   });
-  map.on("mouseup", (e) => {
+  // Bound on `document`, not `map` - a plain Leaflet map.on("mouseup", ...) only fires when the
+  // mouseup itself lands inside the map container, so releasing the drag outside it (easy to do
+  // mid-drag) used to leave `drawing` set forever: cursor stuck as crosshair, map dragging stuck
+  // disabled, and the row's region never committed. mouseEventToLatLng works from any point on
+  // the page (it's just pixel math relative to the container), so one document-level listener
+  // handles both the normal in-map release and this stuck-drag case.
+  document.addEventListener("mouseup", (e) => {
     if (!drawing?.startLatLng) return;
-    const bounds = L.latLngBounds(drawing.startLatLng, e.latlng);
+    // Clamp the release point to the map's own visible edges before converting to a latLng - an
+    // unclamped point far outside the container (e.g. released over the page header) would
+    // extrapolate to a longitude/latitude well outside valid range (seen: -284° West from a
+    // release above-left of the map), same class of bug as clicking a repeated world copy. This
+    // makes "drag past the edge" behave like the common "drag to the canvas edge" convention
+    // instead.
+    const rect = map.getContainer().getBoundingClientRect();
+    const clientX = Math.min(Math.max(e.clientX, rect.left), rect.right);
+    const clientY = Math.min(Math.max(e.clientY, rect.top), rect.bottom);
+    const bounds = L.latLngBounds(drawing.startLatLng, map.mouseEventToLatLng({ clientX, clientY }));
     updateRect(drawing.rowId, bounds);
     const rowId = drawing.rowId;
     drawing = null;
