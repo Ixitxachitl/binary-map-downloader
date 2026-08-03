@@ -1,6 +1,6 @@
 // DOM wiring: config form, per-zoom region rows, live preview, estimate, bake run, report/download.
-import { totalPlannedCount, tileCountForRegion, tileRangeForRegion, tileXToLon, tileYToLat } from "./tileMath.js";
-import { parseBlob, writeBlob } from "./blobFormat.js";
+import { totalPlannedCount, tileCountForRegion, tileRangeForRegion, regionFromZoomRange } from "./tileMath.js";
+import { parseBlob, writeBlob, rangesOverlap, MAX_ZOOM_RANGES } from "./blobFormat.js";
 import { runBake, summarizeBake } from "./bake.js";
 import {
   runSamplePass,
@@ -182,31 +182,55 @@ function regionLabel(region) {
   return `N${region.north.toFixed(2)} S${region.south.toFixed(2)} E${region.east.toFixed(2)} W${region.west.toFixed(2)}`;
 }
 
+/** Every row's rectangle in on-disk range shape ({zoom,xMin,yMin,width,height}), so row-vs-row
+ * and row-vs-uploaded-range comparisons can share blobFormat's own rangesOverlap. */
+function rowRanges() {
+  return state.rows.map((row) => {
+    const region = row.whole ? { whole: true } : row.region || { whole: true };
+    const { xMin, xMax, yMin, yMax } = tileRangeForRegion(row.zoom, region);
+    return { zoom: row.zoom, xMin, yMin, width: xMax - xMin + 1, height: yMax - yMin + 1 };
+  });
+}
+
 /** Returns the sorted list of zoom levels where two or more rows have overlapping regions -
  * baking with an overlap is exactly what corrupts the output blob (see blobFormat.js's format
  * comment: each zoom's tiles must form disjoint dense rectangles), so this is checked before a
  * bake is allowed to start. "Whole world" overlaps with anything else at its own zoom, same as
  * any other pair of overlapping rectangles. */
 function overlappingZooms() {
-  const byZoom = new Map();
-  for (const row of state.rows) {
-    const region = row.whole ? { whole: true } : row.region || { whole: true };
-    if (!byZoom.has(row.zoom)) byZoom.set(row.zoom, []);
-    byZoom.get(row.zoom).push(tileRangeForRegion(row.zoom, region));
-  }
+  const ranges = rowRanges();
   const conflicts = new Set();
-  for (const [zoom, ranges] of byZoom) {
-    for (let i = 0; i < ranges.length; i++) {
-      for (let j = i + 1; j < ranges.length; j++) {
-        const a = ranges[i];
-        const b = ranges[j];
-        if (a.xMin <= b.xMax && a.xMax >= b.xMin && a.yMin <= b.yMax && a.yMax >= b.yMin) {
-          conflicts.add(zoom);
-        }
+  for (let i = 0; i < ranges.length; i++) {
+    for (let j = i + 1; j < ranges.length; j++) {
+      if (ranges[i].zoom === ranges[j].zoom && rangesOverlap(ranges[i], ranges[j])) {
+        conflicts.add(ranges[i].zoom);
       }
     }
   }
   return [...conflicts].sort((x, y) => x - y);
+}
+
+/** True if `outer` covers every tile of `inner` - i.e. a row that fully replaces an uploaded
+ * range, rather than clipping a piece out of it. */
+function rangeContains(outer, inner) {
+  return (
+    outer.xMin <= inner.xMin &&
+    outer.yMin <= inner.yMin &&
+    outer.xMin + outer.width >= inner.xMin + inner.width &&
+    outer.yMin + outer.height >= inner.yMin + inner.height
+  );
+}
+
+/** Uploaded ranges a row overlaps but doesn't fully cover. bake.js drops an uploaded range as soon
+ * as a row at its zoom overlaps it (the row is redoing that ground), which is right when the row
+ * covers it entirely - but a partial overlap would throw away the part the row *doesn't* cover,
+ * silently losing already-baked tiles. Cheaper to refuse the bake and let the user widen the row
+ * or move it off. */
+function partiallySupersededRanges() {
+  const rows = rowRanges();
+  return (state.existingRanges || []).filter((r) =>
+    rows.some((row) => row.zoom === r.zoom && rangesOverlap(row, r) && !rangeContains(row, r)),
+  );
 }
 
 /** "1,234 covered, 56 new" (etc) for a row, given the currently-uploaded existing blob (if any) -
@@ -318,25 +342,6 @@ function rowsAreUntouchedDefault() {
     state.rows[0].whole === true &&
     state.rows[0].linkGroupId == null
   );
-}
-
-/** Converts a zoom-range's tile rectangle back to a lat/lon region - the inverse of
- * tileMath.tileRangeForRegion. tileXToLon(tx,z)/tileYToLat(ty,z) give a tile's west/north edge
- * respectively, so the region's east/south edges come from one tile past xMax/yMax. */
-function regionFromZoomRange(r) {
-  const n = 2 ** r.zoom;
-  const xMax = r.xMin + r.width - 1;
-  const yMax = r.yMin + r.height - 1;
-  if (r.xMin === 0 && r.yMin === 0 && r.width === n && r.height === n) {
-    return { whole: true };
-  }
-  return {
-    whole: false,
-    north: tileYToLat(r.yMin, r.zoom),
-    south: tileYToLat(yMax + 1, r.zoom),
-    west: tileXToLon(r.xMin, r.zoom),
-    east: tileXToLon(xMax + 1, r.zoom),
-  };
 }
 
 /** Replaces the zoom-row list with one row per *range* in an uploaded blob's own zoom-range table
@@ -560,6 +565,28 @@ $("startBakeBtn").addEventListener("click", async () => {
     );
     return;
   }
+  const clipped = partiallySupersededRanges();
+  if (clipped.length > 0) {
+    alert(
+      `${clipped.length} region(s) already in the uploaded blob (at z${[...new Set(clipped.map((r) => r.zoom))].join(", z")}) ` +
+        "are partly - but not fully - covered by a row at the same zoom. Baking would drop the " +
+        "uncovered part of them from the output. Widen the row to cover the whole region, or move " +
+        "it so they don't overlap.",
+    );
+    return;
+  }
+  // The range table's own u8 ceiling. Checked here, not just in writeBlob, because writeBlob only
+  // runs once the bake has finished - hours in, with nothing to download for it. Rows + carried
+  // ranges is an upper bound (a row may supersede a carried range, or be dropped incomplete),
+  // which is the right side to err on for a hard refusal.
+  const projectedRanges = state.rows.length + (state.existingRanges?.length || 0);
+  if (projectedRanges > MAX_ZOOM_RANGES) {
+    alert(
+      `This setup could need up to ${projectedRanges} zoom ranges, and the file format allows at ` +
+        `most ${MAX_ZOOM_RANGES}. Merge adjacent rows into fewer, larger regions first.`,
+    );
+    return;
+  }
   const plannedCount = totalPlannedCount(config.rows);
   if (
     plannedCount > MAX_SANE_BAKE_TILES &&
@@ -633,7 +660,16 @@ $("startBakeBtn").addEventListener("click", async () => {
   }
   logLine(`Done: ${result.bakedTotal} / ${result.plannedTotal} tiles baked in ${((performance.now() - startedAt) / 1000).toFixed(1)}s`);
 
-  showReport(result, config);
+  // writeBlob validates the assembled ranges/tiles and throws rather than write a file the
+  // firmware would reject. Uncaught, that surfaced only in the console - the run would just end
+  // with no report and no download link, after however many hours of fetching. Surface it in the
+  // log where the user is already looking, and keep it distinct from an ordinary tile failure.
+  try {
+    showReport(result, config);
+  } catch (err) {
+    logLine(`Couldn't assemble the output file: ${err?.message || err}`);
+    logLine("The baked tiles are still in memory - fix the row setup and re-run to reuse them.");
+  }
 });
 
 $("stopBakeBtn").addEventListener("click", () => {

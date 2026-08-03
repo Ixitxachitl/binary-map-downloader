@@ -35,12 +35,20 @@ export const INDEX_RECORD_SIZE = 12; // u8 + u16 + u16 + u8 + u32 + u16
 const ZOOM_RANGE_RECORD_SIZE = 9; // u8 + u16 + u16 + u16 + u16
 const MAGIC_BYTES = [0x4d, 0x54, 0x4c, 0x32]; // 'MTL2'
 
+/** Hard ceiling on the zoom-range table: the count field on the wire is a u8. Exported so ui.js
+ * can refuse a doomed setup before the bake rather than letting writeBlob throw hours later, and
+ * matched by the firmware's own kTileBlobMaxZoomRanges. */
+export const MAX_ZOOM_RANGES = 255;
+
+
 export function coordKey(zoom, tx, ty) {
   return `${zoom},${tx},${ty}`;
 }
 
-/** Rectangle-overlap test for two ranges already known to share a zoom. */
-function rangesOverlap(a, b) {
+/** Rectangle-overlap test for two ranges already known to share a zoom. Exported because the same
+ * question gets asked in three places that must agree: this file's own pre-write validation,
+ * bake.js deciding which uploaded ranges a row supersedes, and ui.js's pre-bake check. */
+export function rangesOverlap(a, b) {
   return a.xMin < b.xMin + b.width && a.xMin + a.width > b.xMin && a.yMin < b.yMin + b.height && a.yMin + a.height > b.yMin;
 }
 
@@ -51,7 +59,9 @@ function rangesOverlap(a, b) {
  * order `ranges` gives, ascending (ty, tx) within each range, since the firmware's own
  * last-entry sanity check assumes that layout. */
 function validateRangesAndTiles(tiles, ranges) {
-  if (ranges.length > 255) throw new Error(`Too many zoom ranges (${ranges.length}) - the wire format's count field is a u8`);
+  if (ranges.length > MAX_ZOOM_RANGES) {
+    throw new Error(`Too many zoom ranges (${ranges.length}) - the wire format's count field is a u8`);
+  }
 
   let prevZoom = -1;
   for (const r of ranges) {

@@ -2,7 +2,7 @@
 // blob, run the fetch+render+threshold pipeline through a bounded worker pool, and report
 // progress/results. Mirrors main()/worker()/bake_tile() in generate_map_tiles.py.
 import { planTiles, tilesForRow, tileRangeForRegion } from "./tileMath.js";
-import { coordKey, KIND_LZ4, INDEX_RECORD_SIZE } from "./blobFormat.js";
+import { coordKey, rangesOverlap, KIND_LZ4, INDEX_RECORD_SIZE } from "./blobFormat.js";
 import { runPool, fetchTileBytes } from "./fetchTiles.js";
 import { decodeRasterTile } from "./rasterSource.js";
 import { rasterizeVectorTile, createVectorTileFetcher } from "./vectorSource.js";
@@ -120,12 +120,15 @@ export async function runBake(config, callbacks = {}) {
   // happen to exist is exactly what caused this format to silently corrupt when two rows shared a
   // zoom, or a run was stopped mid-row. Ranges are built from the rows/existing blob instead, and
   // tiles are pulled in the matching order.
-  const rowZooms = new Set(rows.map((r) => r.zoom));
 
-  // Carried over unchanged from the uploaded blob, for any zoom the current rows don't touch at
-  // all - without this, a zoom present in an extended blob but not re-added as a row would
-  // silently vanish from the output.
-  const carriedRanges = (existingRanges || []).filter((r) => !rowZooms.has(r.zoom));
+  // Each row's exact rectangle, in the same shape as an on-disk range - what the row will
+  // contribute if it completed, and what decides which uploaded ranges it supersedes.
+  const rowRects = rows.map((row) => {
+    const { xMin, xMax, yMin, yMax } = tileRangeForRegion(row.zoom, row.region);
+    return { zoom: row.zoom, xMin, yMin, width: xMax - xMin + 1, height: yMax - yMin + 1 };
+  });
+
+  const carriedRanges = carryForwardRanges(existingRanges, rowRects);
 
   // A row only contributes a range (and its tiles) if every one of its planned cells actually
   // ended up baked this run or earlier (existingTiles). An incomplete row - still in flight when a
@@ -135,7 +138,8 @@ export async function runBake(config, callbacks = {}) {
   // started.
   const rowRanges = [];
   const droppedRows = [];
-  for (const row of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     let complete = true;
     for (const c of tilesForRow(row.zoom, row.region)) {
       if (!tilesByCoord.has(coordKey(...c))) {
@@ -147,8 +151,7 @@ export async function runBake(config, callbacks = {}) {
       droppedRows.push({ zoom: row.zoom, region: row.region });
       continue;
     }
-    const { xMin, xMax, yMin, yMax } = tileRangeForRegion(row.zoom, row.region);
-    rowRanges.push({ zoom: row.zoom, xMin, yMin, width: xMax - xMin + 1, height: yMax - yMin + 1 });
+    rowRanges.push(rowRects[i]);
   }
 
   const ranges = [...carriedRanges, ...rowRanges].sort(
@@ -165,6 +168,22 @@ export async function runBake(config, callbacks = {}) {
     plannedTotal: plannedCoords.length,
     bakedTotal: finalTiles.length,
   };
+}
+
+/** The uploaded blob's ranges that this run should pass through untouched: any range no current
+ * row actually covers. Matched rectangle-by-rectangle, not zoom-by-zoom - a zoom can hold several
+ * disjoint ranges now, so "some row is at this zoom" says nothing about whether *this* range is
+ * being redone. Dropping on zoom alone silently discarded an uploaded region as soon as the user
+ * added a row at the same zoom somewhere else entirely (bake NY at z10, upload, add an LA z10 row,
+ * and NY vanished from the output) - exactly the multi-region case this format exists for.
+ *
+ * A row that only *partly* covers a range still drops the whole thing, losing the uncovered part;
+ * ui.js refuses to start a bake in that state (see partiallySupersededRanges) rather than have
+ * this silently decide it. Exported for the self-tests. */
+export function carryForwardRanges(existingRanges, rowRects) {
+  return (existingRanges || []).filter(
+    (r) => !rowRects.some((rect) => rect.zoom === r.zoom && rangesOverlap(rect, r)),
+  );
 }
 
 /** Pulls one range's tiles from `tilesByCoord` in the ascending (ty, tx) order the wire format

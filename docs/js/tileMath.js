@@ -51,6 +51,41 @@ export function tileRangeForRegion(z, region) {
   return { xMin, xMax, yMin, yMax };
 }
 
+// How far inside a tile the reconstructed region's edges sit, in tile widths. The edges must land
+// strictly *within* the first and last tiles, because tileRangeForRegion floors whatever it's
+// given: an edge exactly on a tile boundary (tileXToLon(xMax + 1), the obvious inverse) floors to
+// the *next* tile, so every reconstructed region came back a column and a row too big. That was
+// harmless while ranges were inferred from the tiles actually baked, but ranges now come straight
+// from the rows, so the inflation is written to the file - and two ranges that merely touch in an
+// uploaded blob would inflate into overlapping and get the next bake refused outright.
+//
+// Quarter/three-quarter rather than the tile edges themselves because latitude also needs the
+// inset: lon <-> tileX is exact linear arithmetic, but lat <-> tileY goes through Mercator
+// transcendentals and doesn't round-trip exactly, so even the north edge could floor a tile early.
+// Fuzzing every rectangle shape across z0-z18 puts both axes at zero failures here.
+const RANGE_EDGE_NEAR = 0.25;
+const RANGE_EDGE_FAR = 0.75;
+
+/** Converts a zoom-range's tile rectangle back to a lat/lon region - the inverse of
+ * tileMath.tileRangeForRegion, such that feeding the result back through it reproduces exactly
+ * the same rectangle. The region therefore sits a fraction of a tile inside the range's true
+ * extent (see above); that's cosmetic and stable, not cumulative. */
+export function regionFromZoomRange(r) {
+  const n = 2 ** r.zoom;
+  const xMax = r.xMin + r.width - 1;
+  const yMax = r.yMin + r.height - 1;
+  if (r.xMin === 0 && r.yMin === 0 && r.width === n && r.height === n) {
+    return { whole: true };
+  }
+  return {
+    whole: false,
+    north: tileYToLat(r.yMin + RANGE_EDGE_NEAR, r.zoom),
+    south: tileYToLat(yMax + RANGE_EDGE_FAR, r.zoom),
+    west: tileXToLon(r.xMin + RANGE_EDGE_NEAR, r.zoom),
+    east: tileXToLon(xMax + RANGE_EDGE_FAR, r.zoom),
+  };
+}
+
 export function tileCountForRegion(z, region) {
   const { xMin, xMax, yMin, yMax } = tileRangeForRegion(z, region);
   return (xMax - xMin + 1) * (yMax - yMin + 1);

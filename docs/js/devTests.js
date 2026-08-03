@@ -1,8 +1,9 @@
 // Self-checks run once on page load - correctness here matters more than usual since this feeds
 // a firmware decoder with no test harness of its own in this repo. Logs to console; surfaces a
 // visible banner only on failure (silent success, loud failure).
-import { lonToTileX, latToTileY } from "./tileMath.js";
+import { lonToTileX, latToTileY, tileRangeForRegion, regionFromZoomRange } from "./tileMath.js";
 import { writeBlob, parseBlob, coordKey, KIND_LZ4, KIND_WHITE } from "./blobFormat.js";
+import { carryForwardRanges } from "./bake.js";
 import { compress as lz4Compress, decompressBlock, makeHashTable } from "../vendor/lz4-block.js";
 
 function assert(cond, msg) {
@@ -131,6 +132,85 @@ function testWriteBlobRejectsOverlappingSameZoomRanges() {
   assert(threw, "writeBlob should reject overlapping same-zoom ranges");
 }
 
+/** regionFromZoomRange must be an exact inverse of tileRangeForRegion: an uploaded blob's ranges
+ * become UI rows via the former, and bake.js turns those rows straight back into the ranges it
+ * writes via the latter, so any drift is written to the output file. The obvious inverse (region
+ * edge = tileXToLon(xMax + 1)) is off by one, because that longitude is the *next* tile's west
+ * edge and tileRangeForRegion floors it there - every reconstructed region came back a column and
+ * a row too big, and two ranges that merely touched inflated into overlapping. Fuzzed rather than
+ * spot-checked because latitude's Mercator round-trip fails on specific rectangles, not all. */
+function testRegionRangeRoundTrip() {
+  // Deterministic LCG - a fixed seed keeps a failure reproducible from the console message alone.
+  let seed = 20260803;
+  const rnd = (n) => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed % n;
+  };
+  let checked = 0;
+  for (let z = 0; z <= 18; z++) {
+    const n = 2 ** z;
+    for (let i = 0; i < 200; i++) {
+      const w = 1 + rnd(Math.min(n, 8));
+      const h = 1 + rnd(Math.min(n, 8));
+      const range = { zoom: z, xMin: rnd(n - w + 1), yMin: rnd(n - h + 1), width: w, height: h };
+      const { xMin, xMax, yMin, yMax } = tileRangeForRegion(z, regionFromZoomRange(range));
+      assert(
+        xMin === range.xMin &&
+          xMax === range.xMin + range.width - 1 &&
+          yMin === range.yMin &&
+          yMax === range.yMin + range.height - 1,
+        `range -> region -> range drifted at z${z} ` +
+          `[${range.xMin},${range.yMin} ${range.width}x${range.height}] -> [${xMin},${yMin} ${xMax - xMin + 1}x${yMax - yMin + 1}]`,
+      );
+      checked++;
+    }
+  }
+  assert(checked > 0, "round-trip fuzz didn't actually run");
+
+  // Whole-world ranges take the { whole: true } shortcut and must survive it too.
+  for (const z of [0, 1, 5, 10]) {
+    const n = 2 ** z;
+    const whole = { zoom: z, xMin: 0, yMin: 0, width: n, height: n };
+    const { xMin, xMax, yMin, yMax } = tileRangeForRegion(z, regionFromZoomRange(whole));
+    assert(xMin === 0 && yMin === 0 && xMax === n - 1 && yMax === n - 1, `whole-world round-trip failed at z${z}`);
+  }
+}
+
+/** Two ranges that merely touch (share an edge, no shared tile) must stay non-overlapping through
+ * the round-trip - this is the concrete symptom the off-by-one caused: uploading a valid two-region
+ * blob and changing nothing got the next bake refused for "rows overlap". */
+function testTouchingRangesStayDisjoint() {
+  const left = { zoom: 10, xMin: 100, yMin: 100, width: 5, height: 5 };
+  const right = { zoom: 10, xMin: 105, yMin: 100, width: 5, height: 5 };
+  const a = tileRangeForRegion(10, regionFromZoomRange(left));
+  const b = tileRangeForRegion(10, regionFromZoomRange(right));
+  assert(a.xMax < b.xMin, `touching ranges overlapped after round-trip: ${a.xMax} >= ${b.xMin}`);
+}
+
+/** Extending a blob must keep every region the current rows aren't redoing. Matching on zoom
+ * alone dropped an uploaded region as soon as any row shared its zoom, so baking a second city
+ * at a zoom you'd already baked elsewhere silently threw the first one away. */
+function testCarryForwardKeepsDisjointRangesAtTheSameZoom() {
+  const ny = { zoom: 10, xMin: 300, yMin: 384, width: 4, height: 3 };
+  const la = { zoom: 10, xMin: 176, yMin: 408, width: 3, height: 2 };
+  const z8 = { zoom: 8, xMin: 10, yMin: 20, width: 2, height: 2 };
+
+  // A row over LA must not disturb the uploaded NY range at the same zoom.
+  const kept = carryForwardRanges([ny, z8], [la]);
+  assert(kept.length === 2, `disjoint same-zoom range was dropped (kept ${kept.length} of 2)`);
+  assert(kept.some((r) => r.xMin === ny.xMin), "NY range should have been carried forward");
+  assert(kept.some((r) => r.zoom === 8), "untouched zoom should have been carried forward");
+
+  // A row over NY itself supersedes it - it's being rebaked, so carrying it too would duplicate.
+  assert(carryForwardRanges([ny], [ny]).length === 0, "a row covering a range should supersede it");
+
+  // Same rectangle at a different zoom addresses different tiles entirely.
+  assert(carryForwardRanges([ny], [{ ...ny, zoom: 11 }]).length === 1, "different zoom should not supersede");
+
+  // No upload at all is the ordinary first-bake case.
+  assert(carryForwardRanges(null, [ny]).length === 0, "null existingRanges should yield nothing");
+}
+
 export function runDevTests() {
   const tests = [
     ["tileMath", testTileMath],
@@ -138,6 +218,9 @@ export function runDevTests() {
     ["blob round-trip", testBlobRoundTrip],
     ["multi-range blob round-trip", testMultiRangeBlobRoundTrip],
     ["writeBlob rejects overlapping ranges", testWriteBlobRejectsOverlappingSameZoomRanges],
+    ["range <-> region round-trip", testRegionRangeRoundTrip],
+    ["touching ranges stay disjoint", testTouchingRangesStayDisjoint],
+    ["carry-forward keeps disjoint same-zoom ranges", testCarryForwardKeepsDisjointRangesAtTheSameZoom],
   ];
   const failures = [];
   for (const [name, fn] of tests) {
