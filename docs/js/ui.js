@@ -668,7 +668,10 @@ $("startBakeBtn").addEventListener("click", async () => {
     showReport(result, config);
   } catch (err) {
     logLine(`Couldn't assemble the output file: ${err?.message || err}`);
-    logLine("The baked tiles are still in memory - fix the row setup and re-run to reuse them.");
+    logLine(
+      "Nothing was downloaded, and this run's fetched tiles aren't kept anywhere - fix the row " +
+        "setup below and re-run; it'll re-fetch from scratch.",
+    );
   }
 });
 
