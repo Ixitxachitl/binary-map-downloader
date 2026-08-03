@@ -1,6 +1,6 @@
 // DOM wiring: config form, per-zoom region rows, live preview, estimate, bake run, report/download.
-import { totalPlannedCount, tileCountForRegion, tileXToLon, tileYToLat } from "./tileMath.js";
-import { parseBlob, writeBlob, computeZoomRanges } from "./blobFormat.js";
+import { totalPlannedCount, tileCountForRegion, tileRangeForRegion, tileXToLon, tileYToLat } from "./tileMath.js";
+import { parseBlob, writeBlob } from "./blobFormat.js";
 import { runBake, summarizeBake } from "./bake.js";
 import {
   runSamplePass,
@@ -42,6 +42,7 @@ const state = {
   nextLinkGroupId: 1,
   existingTiles: null,
   existingTilesByZoom: null, // groupExistingTilesByZoom(existingTiles) - computed once per upload, not per row
+  existingRanges: null, // that upload's own zoom-range table - see bake.js's "carried over" ranges
   previewLocation: null, // { lat, lon }
 };
 
@@ -141,6 +142,7 @@ function buildConfig() {
     maxConsecutiveFailures: Number($("maxFailures").value) || 10,
     rows: state.rows.map((r) => ({ zoom: r.zoom, region: r.whole ? { whole: true } : r.region || { whole: true } })),
     existingTiles: state.existingTiles,
+    existingRanges: state.existingRanges,
     raster: {
       urlTemplate: $("rasterUrlTemplate").value.trim(),
       threshold: Number($("rasterThreshold").value),
@@ -178,6 +180,33 @@ const picker = createRegionPicker("regionMap", {
 function regionLabel(region) {
   if (!region || region.whole) return "whole world";
   return `N${region.north.toFixed(2)} S${region.south.toFixed(2)} E${region.east.toFixed(2)} W${region.west.toFixed(2)}`;
+}
+
+/** Returns the sorted list of zoom levels where two or more rows have overlapping regions -
+ * baking with an overlap is exactly what corrupts the output blob (see blobFormat.js's format
+ * comment: each zoom's tiles must form disjoint dense rectangles), so this is checked before a
+ * bake is allowed to start. "Whole world" overlaps with anything else at its own zoom, same as
+ * any other pair of overlapping rectangles. */
+function overlappingZooms() {
+  const byZoom = new Map();
+  for (const row of state.rows) {
+    const region = row.whole ? { whole: true } : row.region || { whole: true };
+    if (!byZoom.has(row.zoom)) byZoom.set(row.zoom, []);
+    byZoom.get(row.zoom).push(tileRangeForRegion(row.zoom, region));
+  }
+  const conflicts = new Set();
+  for (const [zoom, ranges] of byZoom) {
+    for (let i = 0; i < ranges.length; i++) {
+      for (let j = i + 1; j < ranges.length; j++) {
+        const a = ranges[i];
+        const b = ranges[j];
+        if (a.xMin <= b.xMax && a.xMax >= b.xMin && a.yMin <= b.yMax && a.yMax >= b.yMin) {
+          conflicts.add(zoom);
+        }
+      }
+    }
+  }
+  return [...conflicts].sort((x, y) => x - y);
 }
 
 /** "1,234 covered, 56 new" (etc) for a row, given the currently-uploaded existing blob (if any) -
@@ -310,12 +339,14 @@ function regionFromZoomRange(r) {
   };
 }
 
-/** Replaces the zoom-row list with one row per zoom level present in `tiles` (an uploaded blob's
- * parsed tiles), region set to match that zoom's actual coverage - so uploading a blob to extend
- * shows what's already baked instead of leaving the row list unrelated to the file. */
-function populateRowsFromTiles(tiles) {
+/** Replaces the zoom-row list with one row per *range* in an uploaded blob's own zoom-range table
+ * (its actual, authoritative coverage - not inferred from the tiles), region set to match that
+ * range's rectangle - so uploading a blob to extend shows what's already baked instead of leaving
+ * the row list unrelated to the file. A zoom covered by more than one disjoint range in the file
+ * becomes more than one row here, matching it exactly. */
+function populateRowsFromRanges(ranges) {
   removeAllRows();
-  for (const r of computeZoomRanges(tiles)) {
+  for (const r of ranges) {
     const region = regionFromZoomRange(r);
     const row = {
       id: state.nextRowId++,
@@ -472,12 +503,13 @@ $("extendBlobInput").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const buf = await file.arrayBuffer();
-    const parsed = parseBlob(buf);
+    const { tiles, ranges } = parseBlob(buf);
 
     // Grouped once here (O(n)), not rescanned per row/per estimate refresh - a big upload (a
     // million+ tiles isn't unusual) made that rescan-per-row approach visibly slow.
-    state.existingTiles = parsed;
-    state.existingTilesByZoom = groupExistingTilesByZoom(parsed);
+    state.existingTiles = tiles;
+    state.existingTilesByZoom = groupExistingTilesByZoom(tiles);
+    state.existingRanges = ranges;
 
     if (
       rowsAreUntouchedDefault() ||
@@ -486,16 +518,17 @@ $("extendBlobInput").addEventListener("change", async (e) => {
           "(Your in-progress row setup will be cleared - cancel to keep it and just extend from the file's tiles.)",
       )
     ) {
-      populateRowsFromTiles(parsed.values());
+      populateRowsFromRanges(ranges);
     }
 
-    $("extendBlobStatus").textContent = `Loaded ${parsed.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
+    $("extendBlobStatus").textContent = `Loaded ${tiles.size} tile(s) from '${file.name}' - these will be kept and skipped.`;
     refreshRowCoverage();
     scheduleEstimate();
   } catch (err) {
     $("extendBlobStatus").textContent = `Failed to load '${file.name}': ${err.message || err}`;
     state.existingTiles = null;
     state.existingTilesByZoom = null;
+    state.existingRanges = null;
   }
 });
 
@@ -517,6 +550,14 @@ $("startBakeBtn").addEventListener("click", async () => {
   }
   if (config.mode === "vector" && !config.vector.urlTemplate) {
     alert("Enter (or wait for) a vector tile URL template first.");
+    return;
+  }
+  const conflicts = overlappingZooms();
+  if (conflicts.length > 0) {
+    alert(
+      `Rows at z${conflicts.join(", z")} overlap another row at the same zoom - when multiple ` +
+        "rows share a zoom level, their regions must be disjoint. Adjust or remove one of them.",
+    );
     return;
   }
   const plannedCount = totalPlannedCount(config.rows);
@@ -584,6 +625,12 @@ $("startBakeBtn").addEventListener("click", async () => {
   abortController = null;
 
   if (result.aborted) logLine(result.abortReason || "Stopped.");
+  for (const dropped of result.droppedRows) {
+    logLine(
+      `z${dropped.zoom} (${regionLabel(dropped.region)}) wasn't finished before stopping - none of ` +
+        "its tiles were included this time, it'll be refetched next run.",
+    );
+  }
   logLine(`Done: ${result.bakedTotal} / ${result.plannedTotal} tiles baked in ${((performance.now() - startedAt) / 1000).toFixed(1)}s`);
 
   showReport(result, config);
@@ -595,9 +642,9 @@ $("stopBakeBtn").addEventListener("click", () => {
 });
 
 function showReport(result, config) {
-  const { tiles } = result;
+  const { tiles, ranges } = result;
   const summary = summarizeBake(tiles, config.tileSize);
-  const blobBytes = writeBlob(tiles);
+  const blobBytes = writeBlob(tiles, ranges);
   const blobUrl = URL.createObjectURL(new Blob([blobBytes], { type: "application/octet-stream" }));
 
   const table = $("reportTable");

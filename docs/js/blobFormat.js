@@ -9,9 +9,19 @@
 //
 // The zoom-range table exists so the firmware can compute a tile's index algebraically (no
 // per-tile RAM index - see the firmware's comments) even when a zoom level only covers part of
-// the world: each zoom's entries must span exactly [xMin, xMin+width) x [yMin, yMin+height) in
-// ascending (ty, tx) order, which is exactly what bake.js's per-row planning already produces -
-// this module just needs to record that rectangle per zoom, not change what gets fetched/baked.
+// the world: each *range*'s entries must span exactly [xMin, xMin+width) x [yMin, yMin+height) in
+// ascending (ty, tx) order, and ranges themselves are ordered by ascending zoom and laid out
+// back-to-back in that same order in the tile-entry table.
+//
+// A zoom level may now be covered by more than one range, as long as they don't overlap each
+// other - this lets a single blob hold multiple disjoint regions at the same zoom (e.g. two
+// separate cities baked at the same zoom without also covering the ocean between them). Callers
+// (bake.js) are responsible for supplying one range per contiguous region they actually baked -
+// this module just encodes/decodes/validates whatever range list it's given, it doesn't infer
+// ranges from tiles. This is a validation-rule relaxation only: the on-disk layout is unchanged
+// from when every zoom was limited to exactly one range, and old firmware builds (which require
+// strictly-ascending, non-repeating zooms) safely refuse a file that actually uses two ranges for
+// the same zoom rather than misreading it - see MapTileBlobFormat.h's validateTileBlobZoomRanges.
 //
 // Magic was bumped from 'MTLB' to 'MTL2' when the zoom-range table was introduced, so an old
 // dense-pyramid-only blob (or a new one read by old firmware) fails cleanly on the magic check
@@ -29,35 +39,59 @@ export function coordKey(zoom, tx, ty) {
   return `${zoom},${tx},${ty}`;
 }
 
-/** Derives each distinct zoom's {xMin,yMin,width,height} from the actual tx/ty extent of tiles
- * present for that zoom, in ascending zoom order - the shape the firmware's zoom-range table
- * expects. Assumes (as bake.js/tileMath.js already guarantee) that each zoom's tiles are exactly
- * one dense rectangle. Exported for ui.js too, to populate the zoom-row list from an uploaded
- * blob's actual coverage. `tiles` can be any iterable of {zoom,tx,ty,...} - an array or a Map's
- * .values() both work. */
-export function computeZoomRanges(tiles) {
-  const byZoom = new Map();
-  for (const t of tiles) {
-    let r = byZoom.get(t.zoom);
-    if (!r) {
-      r = { zoom: t.zoom, xMin: t.tx, yMin: t.ty, xMax: t.tx, yMax: t.ty };
-      byZoom.set(t.zoom, r);
-    } else {
-      if (t.tx < r.xMin) r.xMin = t.tx;
-      if (t.tx > r.xMax) r.xMax = t.tx;
-      if (t.ty < r.yMin) r.yMin = t.ty;
-      if (t.ty > r.yMax) r.yMax = t.ty;
-    }
-  }
-  return [...byZoom.values()]
-    .sort((a, b) => a.zoom - b.zoom)
-    .map((r) => ({ zoom: r.zoom, xMin: r.xMin, yMin: r.yMin, width: r.xMax - r.xMin + 1, height: r.yMax - r.yMin + 1 }));
+/** Rectangle-overlap test for two ranges already known to share a zoom. */
+function rangesOverlap(a, b) {
+  return a.xMin < b.xMin + b.width && a.xMin + a.width > b.xMin && a.yMin < b.yMin + b.height && a.yMin + a.height > b.yMin;
 }
 
-/** tiles: array of { zoom, tx, ty, kind, payload: Uint8Array }, in ascending (zoom, ty, tx)
- * order (what bake.js's finalTiles already produces). */
-export function writeBlob(tiles) {
-  const zoomRanges = computeZoomRanges(tiles);
+/** Throws a clear Error if `ranges`/`tiles` don't satisfy what the firmware's own
+ * validateTileBlobZoomRanges (MapTileBlobFormat.h) requires, so a bug in bake.js's range
+ * assembly fails loudly here in JS instead of silently producing a file the firmware will later
+ * reject (or, worse, misread). Also verifies `tiles` is laid out exactly range-by-range in the
+ * order `ranges` gives, ascending (ty, tx) within each range, since the firmware's own
+ * last-entry sanity check assumes that layout. */
+function validateRangesAndTiles(tiles, ranges) {
+  if (ranges.length > 255) throw new Error(`Too many zoom ranges (${ranges.length}) - the wire format's count field is a u8`);
+
+  let prevZoom = -1;
+  for (const r of ranges) {
+    if (r.zoom < prevZoom) throw new Error("Zoom ranges must be sorted by non-decreasing zoom");
+    prevZoom = r.zoom;
+    if (r.width <= 0 || r.height <= 0) throw new Error(`Zoom ${r.zoom}: range has non-positive width/height`);
+  }
+  for (let i = 0; i < ranges.length; i++) {
+    for (let j = i + 1; j < ranges.length; j++) {
+      if (ranges[i].zoom === ranges[j].zoom && rangesOverlap(ranges[i], ranges[j])) {
+        throw new Error(`Zoom ${ranges[i].zoom}: two ranges overlap - regions sharing a zoom must be disjoint`);
+      }
+    }
+  }
+
+  const totalArea = ranges.reduce((s, r) => s + r.width * r.height, 0);
+  if (totalArea !== tiles.length) {
+    throw new Error(`Zoom-range areas (${totalArea}) don't match tile count (${tiles.length})`);
+  }
+
+  let tileIdx = 0;
+  for (const r of ranges) {
+    for (let ty = r.yMin; ty < r.yMin + r.height; ty++) {
+      for (let tx = r.xMin; tx < r.xMin + r.width; tx++) {
+        const t = tiles[tileIdx++];
+        if (!t || t.zoom !== r.zoom || t.tx !== tx || t.ty !== ty) {
+          throw new Error(`Tile order doesn't match zoom-range table at index ${tileIdx - 1} (expected z${r.zoom}/${tx}/${ty})`);
+        }
+      }
+    }
+  }
+}
+
+/** tiles: array of { zoom, tx, ty, kind, payload: Uint8Array }, laid out range-by-range (see
+ * validateRangesAndTiles) - exactly what bake.js's range assembly produces. ranges: array of
+ * { zoom, xMin, yMin, width, height }, one per contiguous region actually baked - a zoom may have
+ * more than one range as long as they don't overlap (see the format comment above). */
+export function writeBlob(tiles, ranges) {
+  validateRangesAndTiles(tiles, ranges);
+  const zoomRanges = ranges; // kept as `zoomRanges` below to mirror the on-disk field name
 
   let payloadSize = 0;
   for (const t of tiles) payloadSize += t.payload.length;
@@ -104,10 +138,10 @@ export function writeBlob(tiles) {
   return bytes;
 }
 
-/** Reconstructs a Map<coordKey, {zoom,tx,ty,kind,payload}> from a previously-downloaded .bin,
- * so a new run can skip tiles it already contains ("extend an existing blob" workflow). Doesn't
- * need the zoom-range table's contents for anything (each tile's own zoom/tx/ty is already in
- * its entry) - just needs to skip over it to find where the tile-entry table actually starts. */
+/** Reconstructs { tiles: Map<coordKey, {zoom,tx,ty,kind,payload}>, ranges: [{zoom,xMin,yMin,
+ * width,height}] } from a previously-downloaded .bin, so a new run can skip tiles it already
+ * contains ("extend an existing blob" workflow) and so bake.js can carry forward, unchanged, any
+ * range this session's rows don't touch (rather than silently dropping it - see bake.js). */
 export function parseBlob(arrayBuffer) {
   const view = new DataView(arrayBuffer);
   const bytes = new Uint8Array(arrayBuffer);
@@ -126,11 +160,25 @@ export function parseBlob(arrayBuffer) {
     throw new Error("Truncated MTL2 blob (no zoom-range count)");
   }
   const zoomRangeCount = view.getUint8(headerSize);
-  const indexTableStart = headerSize + 1 + zoomRangeCount * ZOOM_RANGE_RECORD_SIZE;
+  const zoomRangeTableStart = headerSize + 1;
+  const indexTableStart = zoomRangeTableStart + zoomRangeCount * ZOOM_RANGE_RECORD_SIZE;
   const indexSize = count * INDEX_RECORD_SIZE;
   const payloadBase = indexTableStart + indexSize;
   if (payloadBase > view.byteLength) {
     throw new Error("Truncated MTL2 blob (zoom-range/tile-entry table doesn't fit)");
+  }
+
+  const ranges = [];
+  let rangeOff = zoomRangeTableStart;
+  for (let i = 0; i < zoomRangeCount; i++) {
+    ranges.push({
+      zoom: view.getUint8(rangeOff),
+      xMin: view.getUint16(rangeOff + 1, true),
+      yMin: view.getUint16(rangeOff + 3, true),
+      width: view.getUint16(rangeOff + 5, true),
+      height: view.getUint16(rangeOff + 7, true),
+    });
+    rangeOff += ZOOM_RANGE_RECORD_SIZE;
   }
 
   const tiles = new Map();
@@ -151,5 +199,5 @@ export function parseBlob(arrayBuffer) {
     const payload = bytes.slice(start, start + size);
     tiles.set(coordKey(zoom, tx, ty), { zoom, tx, ty, kind, payload });
   }
-  return tiles;
+  return { tiles, ranges };
 }

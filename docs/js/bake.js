@@ -1,8 +1,8 @@
 // Orchestrator: enumerate planned tiles, skip anything already present in an uploaded/extended
 // blob, run the fetch+render+threshold pipeline through a bounded worker pool, and report
 // progress/results. Mirrors main()/worker()/bake_tile() in generate_map_tiles.py.
-import { planTiles } from "./tileMath.js";
-import { coordKey, KIND_LZ4, KIND_WHITE, KIND_BLACK, INDEX_RECORD_SIZE } from "./blobFormat.js";
+import { planTiles, tilesForRow, tileRangeForRegion } from "./tileMath.js";
+import { coordKey, KIND_LZ4, INDEX_RECORD_SIZE } from "./blobFormat.js";
 import { runPool, fetchTileBytes } from "./fetchTiles.js";
 import { decodeRasterTile } from "./rasterSource.js";
 import { rasterizeVectorTile, createVectorTileFetcher } from "./vectorSource.js";
@@ -38,6 +38,7 @@ export function makeVectorFetcher(config) {
  *   tileSize, workers, maxConsecutiveFailures,
  *   rows: [{ zoom, region }],                 // see tileMath.planTiles
  *   existingTiles: Map<coordKey, BakedTile> | null,   // from an uploaded blob, to extend
+ *   existingRanges: [{zoom,xMin,yMin,width,height}] | null,  // that blob's own zoom-range table
  *   raster: { urlTemplate, threshold, invert },
  *   vector: { urlTemplate, sourceMaxzoom, roadClasses, roadMinzoom, boundaryMaxAdminLevel,
  *             labelClasses, lineWidth, waterFill },
@@ -49,9 +50,17 @@ export function makeVectorFetcher(config) {
  * be a large head start on `done` for an "extend an existing blob" run, so newlyFetched/newTotal
  * (this run's actual fetch count, excluding anything skipped) is provided too, to keep the
  * progress display honest about how much *new* work is happening.
+ *
+ * Returns { tiles, ranges, droppedRows, aborted, abortReason, plannedTotal, bakedTotal }. `ranges`
+ * is the zoom-range table to write alongside `tiles` (see blobFormat.js's writeBlob) - built from
+ * each row's own exact rectangle, not inferred from the tiles themselves (see the comment on the
+ * assembly step below for why). `droppedRows` lists any row that didn't finish this run (stopped
+ * or failed out partway through) - its tiles, if any, are excluded from `tiles`/`ranges` entirely
+ * rather than written as a non-dense (and therefore firmware-invalid) range; re-running will
+ * re-fetch it via the normal existingTiles skip-what's-already-there path.
  */
 export async function runBake(config, callbacks = {}) {
-  const { workers, maxConsecutiveFailures, rows, existingTiles, signal } = config;
+  const { workers, maxConsecutiveFailures, rows, existingTiles, existingRanges, signal } = config;
 
   const plannedCoords = planTiles(rows);
   const tilesByCoord = new Map(existingTiles ? existingTiles.entries() : []);
@@ -59,9 +68,6 @@ export async function runBake(config, callbacks = {}) {
   const todo = plannedCoords.filter(([z, x, y]) => !tilesByCoord.has(coordKey(z, x, y)));
 
   const vectorFetcher = makeVectorFetcher(config);
-
-  const kindCounts = { [KIND_LZ4]: 0, [KIND_WHITE]: 0, [KIND_BLACK]: 0 };
-  for (const t of tilesByCoord.values()) kindCounts[t.kind]++;
 
   let fetchedCount = 0;
   let downloadBytes = 0;
@@ -89,7 +95,6 @@ export async function runBake(config, callbacks = {}) {
       consecutiveFailures = 0;
       const tile = { zoom: z, tx, ty, kind: result.kind, payload: result.payload };
       tilesByCoord.set(coordKey(z, tx, ty), tile);
-      kindCounts[result.kind]++;
       fetchedCount++;
       downloadBytes += result.downloadBytes;
       callbacks.onProgress?.({
@@ -109,22 +114,70 @@ export async function runBake(config, callbacks = {}) {
     abortReason = "Stopped by user.";
   }
 
-  // Preserve deterministic (z, ty, tx) ordering regardless of completion order. A stopped run
-  // simply yields whatever's present - the same "partial blob" a crash mid-run would leave.
-  const finalTiles = [];
-  for (const c of plannedCoords) {
-    const t = tilesByCoord.get(coordKey(...c));
-    if (t) finalTiles.push(t);
+  // Assemble the zoom-range table + tiles to write, instead of just handing back whatever's in
+  // tilesByCoord: each zoom's tiles must form one or more exact dense rectangles (see
+  // blobFormat.js's format comment) - a bounding box inferred after the fact from whatever tiles
+  // happen to exist is exactly what caused this format to silently corrupt when two rows shared a
+  // zoom, or a run was stopped mid-row. Ranges are built from the rows/existing blob instead, and
+  // tiles are pulled in the matching order.
+  const rowZooms = new Set(rows.map((r) => r.zoom));
+
+  // Carried over unchanged from the uploaded blob, for any zoom the current rows don't touch at
+  // all - without this, a zoom present in an extended blob but not re-added as a row would
+  // silently vanish from the output.
+  const carriedRanges = (existingRanges || []).filter((r) => !rowZooms.has(r.zoom));
+
+  // A row only contributes a range (and its tiles) if every one of its planned cells actually
+  // ended up baked this run or earlier (existingTiles). An incomplete row - still in flight when a
+  // stop/failure-abort happened - can't be represented as one dense rectangle, so it's dropped
+  // whole rather than written as a bogus non-dense range. Only the row(s) in flight at the moment
+  // of a stop can end up here: everything planned earlier already finished, everything later never
+  // started.
+  const rowRanges = [];
+  const droppedRows = [];
+  for (const row of rows) {
+    let complete = true;
+    for (const c of tilesForRow(row.zoom, row.region)) {
+      if (!tilesByCoord.has(coordKey(...c))) {
+        complete = false;
+        break;
+      }
+    }
+    if (!complete) {
+      droppedRows.push({ zoom: row.zoom, region: row.region });
+      continue;
+    }
+    const { xMin, xMax, yMin, yMax } = tileRangeForRegion(row.zoom, row.region);
+    rowRanges.push({ zoom: row.zoom, xMin, yMin, width: xMax - xMin + 1, height: yMax - yMin + 1 });
   }
+
+  const ranges = [...carriedRanges, ...rowRanges].sort(
+    (a, b) => a.zoom - b.zoom || a.xMin - b.xMin || a.yMin - b.yMin,
+  );
+  const finalTiles = ranges.flatMap((r) => tilesForRange(r, tilesByCoord));
 
   return {
     tiles: finalTiles,
-    kindCounts,
+    ranges,
+    droppedRows,
     aborted,
     abortReason,
     plannedTotal: plannedCoords.length,
     bakedTotal: finalTiles.length,
   };
+}
+
+/** Pulls one range's tiles from `tilesByCoord` in the ascending (ty, tx) order the wire format
+ * requires - the range's rectangle is assumed fully dense (callers only build a range once
+ * they've confirmed that). */
+function tilesForRange(range, tilesByCoord) {
+  const out = [];
+  for (let ty = range.yMin; ty < range.yMin + range.height; ty++) {
+    for (let tx = range.xMin; tx < range.xMin + range.width; tx++) {
+      out.push(tilesByCoord.get(coordKey(range.zoom, tx, ty)));
+    }
+  }
+  return out;
 }
 
 /** Mirrors print_report()'s size/kind math, for the end-of-run report panel. */
