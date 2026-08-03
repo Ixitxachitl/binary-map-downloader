@@ -10,9 +10,11 @@ region per zoom level (or use the whole world), preview how it'll render, bake, 
 `.bin`. No server, no build step, no API key required for the default vector source
 ([OpenFreeMap](https://openfreemap.org/) - free, keyless, unlimited, OpenMapTiles schema).
 
+**Hosted copy:** https://ixitxachitl.github.io/binary-map-downloader/
+
 To use it locally: serve `docs/` with any static file server (e.g. `npx http-server docs`) and
-open `index.html`. To publish it: enable GitHub Pages for this repo (Settings -> Pages -> Deploy
-from a branch -> `main` / `docs`), and the tool will be live at
+open `index.html`. To publish your own: enable GitHub Pages for this repo (Settings -> Pages ->
+Deploy from a branch -> `main` / `docs`), and the tool will be live at
 `https://<user>.github.io/<repo>/`.
 
 Highlights:
